@@ -31,7 +31,19 @@ func NewProvider(ctx context.Context, zone string, projectID string) (*Provider,
 func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	ctx, span := trace.StartSpan(ctx, "confidentialspace.CreatePod")
 	defer span.End()
-	p.csClient.Insert()
+	instance, err := p.csClient.PodToInstance(pod)
+	if err != nil {
+		return fmt.Errorf("failed to create Instance object from Pod object: %v", err)
+	}
+	op, err := p.csClient.Insert(ctx, instance)
+	if err != nil {
+		return err
+	}
+
+	err = op.Wait(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to wait for GCE instance insert: %w", err)
+	}
 
 	return nil
 }
@@ -39,35 +51,53 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 // UpdatePod is not required nor called by VK. Confidential Space also does not
 // allow runtime container/pod updates.
 func (p *Provider) UpdatePod(ctx context.Context, pod *v1.Pod) error {
-	ctx, span := trace.StartSpan(ctx, "confidentialspace.UpdatePod")
+	_, span := trace.StartSpan(ctx, "confidentialspace.UpdatePod")
 	defer span.End()
 	return nil
 }
 
-// Deletes the VM backing the Confidential Space pod.
+// DeletePod deletes the VM backing the Confidential Space pod.
 func (p *Provider) DeletePod(ctx context.Context, pod *v1.Pod) error {
-	ctx, span := trace.StartSpan(ctx, "confidentialspace.DeletePod")
+	_, span := trace.StartSpan(ctx, "confidentialspace.DeletePod")
 	defer span.End()
+	op, err := p.csClient.Delete(ctx, pod)
+	if err != nil {
+		return err
+	}
+	if err = op.Wait(ctx); err != nil {
+		return fmt.Errorf("unable to wait for the operation: %w", err)
+	}
+
 	return nil
 }
 
-// Provider function to return a Pod spec - mostly used for its status
+// Provider function to return a Pod spec - mostly used for its status.
 func (p *Provider) GetPod(ctx context.Context, namespace, name string) (*v1.Pod, error) {
-	ctx, span := trace.StartSpan(ctx, "confidentialspace.GetPod")
+	_, span := trace.StartSpan(ctx, "confidentialspace.GetPod")
 	defer span.End()
-	return &v1.Pod{}, nil
+	// TODO: add some caching
+	instance, err := p.csClient.Get(ctx, namespace, name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to Get instance %v", name)
+	}
+	return p.csClient.InstanceToPod(instance)
 }
 
 func (p *Provider) GetPodStatus(ctx context.Context, namespace, name string) (*v1.PodStatus, error) {
-	ctx, span := trace.StartSpan(ctx, "confidentialspace.GetPodStatus")
+	_, span := trace.StartSpan(ctx, "confidentialspace.GetPodStatus")
 	defer span.End()
-	return &v1.PodStatus{}, nil
+	// TODO: speed up all the API calls and fetch only PodStatus
+	pod, err := p.GetPod(ctx, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	return &pod.Status, nil
 }
 
 // GetPods returns a list of all pods running on the Confidential Space
 // provider.
 func (p *Provider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
-	ctx, span := trace.StartSpan(ctx, "confidentialspace.GetPods")
+	_, span := trace.StartSpan(ctx, "confidentialspace.GetPods")
 	defer span.End()
 	return nil, nil
 }

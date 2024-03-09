@@ -3,6 +3,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/alexmwu/confidential-space-shim/pkg/confidentialspace"
@@ -99,5 +100,19 @@ func (p *Provider) GetPodStatus(ctx context.Context, namespace, name string) (*v
 func (p *Provider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
 	_, span := trace.StartSpan(ctx, "confidentialspace.GetPods")
 	defer span.End()
-	return nil, nil
+	var wrappedErr error
+	var pods []*v1.Pod
+	instances, err := p.csClient.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed fetching all CS VK instances: %v", err)
+	}
+	for _, instance := range instances {
+		pod, err := p.csClient.InstanceToPod(instance)
+		if err != nil {
+			wrappedErr = errors.Join(wrappedErr, err)
+		} else {
+			pods = append(pods, pod)
+		}
+	}
+	return pods, wrappedErr
 }

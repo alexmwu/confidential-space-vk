@@ -12,6 +12,7 @@ import (
 	compute "cloud.google.com/go/compute/apiv1"
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
 	"github.com/google/go-tpm-tools/launcher/spec"
+	"google.golang.org/api/iterator"
 	"google.golang.org/protobuf/proto"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -123,6 +124,32 @@ func (c *Client) Delete(ctx context.Context, pod *v1.Pod) (*compute.Operation, e
 	}
 
 	return op, nil
+}
+
+func (c *Client) List(ctx context.Context) ([]*computepb.Instance, error) {
+	var out []*computepb.Instance
+	var wrappedErr error
+	req := &computepb.AggregatedListInstancesRequest{
+		Project: c.projectID,
+		Filter:  unaddressableToPtr(fmt.Sprintf("(zone:%v)(labels.%v:%v)", c.zone, vkTypeLabel, csType)),
+	}
+
+	it := c.instancesClient.AggregatedList(ctx, req)
+	for {
+		pair, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			wrappedErr = errors.Join(wrappedErr, err)
+		}
+		instances := pair.Value.Instances
+		if len(instances) > 0 {
+			out = append(out, instances...)
+		}
+	}
+	return out, nil
+
 }
 
 func (c *Client) Get(ctx context.Context, namespace, name string) (*computepb.Instance, error) {

@@ -5,8 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/alexmwu/confidential-space-shim/pkg/confidentialspace"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/virtual-kubelet/virtual-kubelet/node/api"
+	"github.com/virtual-kubelet/virtual-kubelet/node/api/statsv1alpha1"
 	"github.com/virtual-kubelet/virtual-kubelet/trace"
 	v1 "k8s.io/api/core/v1"
 )
@@ -115,4 +119,52 @@ func (p *Provider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
 		}
 	}
 	return pods, wrappedErr
+}
+
+// GetContainerLogs retrieves the logs of a container by name from the provider.
+func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
+	_, span := trace.StartSpan(ctx, "confidentialspace.GetContainerLogs")
+	defer span.End()
+	// TODO: implement a way to get workload logs.
+	return nil, nil
+}
+
+// RunInContainer is not implemented. Confidential Space does not allow
+// runtime workload modifications.
+func (p *Provider) RunInContainer(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
+	_, span := trace.StartSpan(ctx, "confidentialspace.RunInContainer")
+	defer span.End()
+	return nil
+}
+
+// AttachToContainer is not implemented. Confidential Space does not allow
+// runtime container attachments.
+func (p *Provider) AttachToContainer(ctx context.Context, namespace, podName, containerName string, attach api.AttachIO) error {
+	_, span := trace.StartSpan(ctx, "confidentialspace.AttachToContainer")
+	defer span.End()
+	return nil
+}
+
+// GetStatsSummary gets the stats for the node, including running pods
+func (p *Provider) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
+	_, span := trace.StartSpan(ctx, "confidentialspace.GetStatsSummary")
+	defer span.End()
+	// TODO: implement a way to get CS VM stats.
+	return nil, nil
+}
+
+// GetMetricsResource gets the metrics for the node, including running pods
+func (p *Provider) GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily, error) {
+	_, span := trace.StartSpan(ctx, "confidentialspace.GetMetricsResource")
+	defer span.End()
+	// TODO: implement a way to get CS metrics.
+	return nil, nil
+}
+
+// PortForward is not implemented. Confidential Space does not support port
+// forwarding.
+func (p *Provider) PortForward(ctx context.Context, namespace, pod string, port int32, stream io.ReadWriteCloser) error {
+	_, span := trace.StartSpan(ctx, "confidentialspace.PortForward")
+	defer span.End()
+	return nil
 }

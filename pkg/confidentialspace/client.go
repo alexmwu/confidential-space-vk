@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,17 +22,20 @@ import (
 
 type Client struct {
 	projectID       string
+	projectNumber   int64
 	zone            string
+	serviceAccount  string
 	imagesClient    *compute.ImagesClient
 	csImage         *computepb.Image
 	instancesClient *compute.InstancesClient
 }
 
 const (
-	namespaceLabel = "Namespace"
-	uidLabel       = "UID"
-	vkTypeLabel    = "VKType"
-	csType         = "ConfidentialSpace"
+	namespaceLabel = "namespace"
+	nameLabel      = "name"
+	uidLabel       = "uid"
+	vkTypeLabel    = "vk-type"
+	csType         = "confidential-space"
 )
 
 // Copied from https://github.com/google/go-tpm-tools/blob/main/launcher/spec/launch_spec.go.
@@ -60,10 +64,13 @@ func isValid(p spec.RestartPolicy) error {
 }
 
 // Currently depends on Application Default Credentials.
-func NewClient(ctx context.Context, zone string, project string) (*Client, error) {
+func NewClient(ctx context.Context, zone string, projectID string, projectNumber int64, serviceAccount string) (*Client, error) {
+	if projectNumber == 0 && serviceAccount == "" {
+		return nil, errors.New("one of project number or service account must be specified")
+	}
 	imagesClient, err := compute.NewImagesRESTClient(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create compute images client: %w", err)
+		return nil, fmt.Errorf("failed to create Compute Images client: %w", err)
 	}
 
 	req := &computepb.GetFromFamilyImageRequest{
@@ -81,8 +88,10 @@ func NewClient(ctx context.Context, zone string, project string) (*Client, error
 	}
 
 	return &Client{
-		projectID:       project,
+		projectID:       projectID,
 		zone:            zone,
+		projectNumber:   projectNumber,
+		serviceAccount:  serviceAccount,
 		imagesClient:    imagesClient,
 		csImage:         image,
 		instancesClient: instancesClient,
@@ -101,12 +110,7 @@ func (c *Client) Insert(ctx context.Context, instance *computepb.Instance) (*com
 		Zone:             c.zone,
 		InstanceResource: instance,
 	}
-	op, err := c.instancesClient.Insert(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to insert GCE instance: %w", err)
-	}
-
-	return op, nil
+	return c.instancesClient.Insert(ctx, req)
 }
 
 // Delete takes an instance name and deletes it with the configured projectID and zone.
@@ -115,48 +119,41 @@ func (c *Client) Delete(ctx context.Context, pod *v1.Pod) (*compute.Operation, e
 	req := &computepb.DeleteInstanceRequest{
 		Project:  c.projectID,
 		Zone:     c.zone,
-		Instance: c.InstanceName(pod),
+		Instance: c.PodToInstanceName(pod),
 	}
 
-	op, err := c.instancesClient.Delete(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to delete instance: %w", err)
-	}
-
-	return op, nil
+	return c.instancesClient.Delete(ctx, req)
 }
 
 func (c *Client) List(ctx context.Context) ([]*computepb.Instance, error) {
 	var out []*computepb.Instance
 	var wrappedErr error
-	req := &computepb.AggregatedListInstancesRequest{
+	req := &computepb.ListInstancesRequest{
 		Project: c.projectID,
-		Filter:  unaddressableToPtr(fmt.Sprintf("(zone:%v)(labels.%v:%v)", c.zone, vkTypeLabel, csType)),
+		Zone:    c.zone,
+		Filter:  unaddressableToPtr(fmt.Sprintf("(labels.%v=%v)", vkTypeLabel, csType)),
 	}
 
-	it := c.instancesClient.AggregatedList(ctx, req)
+	it := c.instancesClient.List(ctx, req)
 	for {
-		pair, err := it.Next()
+		instance, err := it.Next()
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
 			wrappedErr = errors.Join(wrappedErr, err)
 		}
-		instances := pair.Value.Instances
-		if len(instances) > 0 {
-			out = append(out, instances...)
-		}
+		out = append(out, instance)
 	}
-	return out, nil
 
+	return out, nil
 }
 
 func (c *Client) Get(ctx context.Context, namespace, name string) (*computepb.Instance, error) {
 	req := &computepb.GetInstanceRequest{
 		Project:  c.projectID,
 		Zone:     c.zone,
-		Instance: namespace + name,
+		Instance: c.NamespaceNameToInstanceName(namespace, name),
 	}
 
 	return c.instancesClient.Get(ctx, req)
@@ -166,14 +163,31 @@ func (c *Client) GetLatestConfidentialSpace() *computepb.Image {
 	return c.csImage
 }
 
-// InstanceName returns the expected GCE instance name given a Pod.
-func (c *Client) InstanceName(pod *v1.Pod) string {
-	return pod.GetNamespace() + pod.GetName()
+func (c *Client) ComputeDefaultSA() string {
+	return strconv.FormatInt(c.projectNumber, 10) + "-compute@developer.gserviceaccount.com"
+}
+
+// PodToInstanceName returns the expected GCE instance name given a Pod.
+func (c *Client) PodToInstanceName(pod *v1.Pod) string {
+	return c.NamespaceNameToInstanceName(pod.GetNamespace(), pod.GetName())
+}
+
+func (c *Client) NamespaceNameToInstanceName(namespace, name string) string {
+	return namespace + "-" + name
+}
+
+func (c *Client) validateInstanceName(instance *computepb.Instance, pod *v1.Pod) error {
+	if instance.GetName() != c.PodToInstanceName(pod) {
+		return fmt.Errorf("instance name \"%v\" does not match pod namespace (%v), name (%v) (check instance labels):",
+			instance.GetName(), pod.GetNamespace(), pod.GetName())
+	}
+	return nil
 }
 
 func (c *Client) PodToInstance(pod *v1.Pod) (*computepb.Instance, error) {
 	labels := make(map[string]string)
 	labels[namespaceLabel] = pod.GetNamespace()
+	labels[nameLabel] = pod.GetName()
 	labels[uidLabel] = string(pod.GetUID())
 	labels[vkTypeLabel] = csType
 
@@ -187,10 +201,12 @@ func (c *Client) PodToInstance(pod *v1.Pod) (*computepb.Instance, error) {
 	}
 	// TODO: parse ctr.Resources and convert to appropriate sized Instance MachineType.
 	instance := &computepb.Instance{
-		Name:   unaddressableToPtr(c.InstanceName(pod)),
+		Name:   unaddressableToPtr(c.PodToInstanceName(pod)),
 		Labels: labels,
 		Disks: []*computepb.AttachedDisk{
 			{
+				AutoDelete: proto.Bool(true),
+				Boot:       proto.Bool(true),
 				InitializeParams: &computepb.AttachedDiskInitializeParams{
 					DiskSizeGb:  proto.Int64(11),
 					DiskType:    proto.String(fmt.Sprintf("zones/%s/diskTypes/pd-standard", c.zone)),
@@ -198,8 +214,16 @@ func (c *Client) PodToInstance(pod *v1.Pod) (*computepb.Instance, error) {
 				},
 			},
 		},
-		MachineType: proto.String(fmt.Sprintf("zones/%s/machineTypes/n2d-standard-2", c.zone)),
-		Metadata:    md,
+		MachineType:    proto.String(fmt.Sprintf("zones/%s/machineTypes/n2d-standard-2", c.zone)),
+		Metadata:       md,
+		MinCpuPlatform: proto.String("AMD Milan"),
+		NetworkInterfaces: []*computepb.NetworkInterface{
+			{
+				AccessConfigs: []*computepb.AccessConfig{{NetworkTier: proto.String("PREMIUM")}},
+				NicType:       proto.String("GVNIC"),
+			},
+		},
+		ServiceAccounts: []*computepb.ServiceAccount{c.createWorkloadSA()},
 		ConfidentialInstanceConfig: &computepb.ConfidentialInstanceConfig{
 			EnableConfidentialCompute: proto.Bool(true),
 		},
@@ -212,7 +236,19 @@ func (c *Client) PodToInstance(pod *v1.Pod) (*computepb.Instance, error) {
 	return instance, nil
 }
 
+func (c *Client) createWorkloadSA() *computepb.ServiceAccount {
+	email := c.serviceAccount
+	if email == "" {
+		email = c.ComputeDefaultSA()
+	}
+	return &computepb.ServiceAccount{
+		Email:  proto.String(email),
+		Scopes: compute.DefaultAuthScopes(),
+	}
+}
+
 func (c *Client) InstanceToPod(instance *computepb.Instance) (*v1.Pod, error) {
+	fmt.Print(instance)
 	// TODO: parse instance.ConfidentialInstanceConfig, instance.ShieldedInstanceConfig
 	//	instance.Disks
 	//	instance.Hostname
@@ -241,7 +277,7 @@ func (c *Client) InstanceToPod(instance *computepb.Instance) (*v1.Pod, error) {
 	pod.Spec.Containers = append(pod.Spec.Containers, ctr)
 	labels := instance.GetLabels()
 	if val, ok := labels[vkTypeLabel]; !(ok && val == csType) {
-		log.Printf("missing VK label on VK-managed VM: %v", instance.GetName())
+		return nil, fmt.Errorf("missing VK label on VK-managed VM: %v", instance.GetName())
 	}
 	v1Time, err := instanceCreationTimeToV1(instance)
 	if err != nil {
@@ -251,14 +287,26 @@ func (c *Client) InstanceToPod(instance *computepb.Instance) (*v1.Pod, error) {
 
 	ns, ok := labels[namespaceLabel]
 	if !ok {
-		log.Printf("failed to find namespace label for instance %v", instance.GetName())
+		return nil, fmt.Errorf("failed to find namespace label for instance %v", instance.GetName())
 	}
-	pod.ObjectMeta.Namespace = ns
+	name, ok := labels[nameLabel]
+	if !ok {
+		return nil, fmt.Errorf("failed to find name label for instance %v", instance.GetName())
+	}
 	uid, ok := labels[uidLabel]
 	if !ok {
-		log.Printf("failed to find UID label for instance %v", instance.GetName())
+		return nil, fmt.Errorf("failed to find uid label for instance %v", instance.GetName())
 	}
+
+	pod.ObjectMeta.Namespace = ns
+	pod.ObjectMeta.Name = name
 	pod.ObjectMeta.UID = types.UID(uid)
+
+	err = c.validateInstanceName(instance, pod)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert instance to Pod: %v", err)
+	}
+
 	podStatus, err := getPodStatus(instance, ls)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get PodStatus: %v", err)
@@ -323,12 +371,12 @@ func getPodStatus(instance *computepb.Instance, ls *spec.LaunchSpec) (*v1.PodSta
 		phase = v1.PodPending
 		isScheduled = v1.ConditionTrue
 		ctrState = v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: "Instance Status: " + iStatus}}
-	case computepb.Instance_RUNNING.String():
+	case computepb.Instance_RUNNING.String(), computepb.Instance_STOPPING.String():
 		phase = v1.PodRunning
 		isScheduled = v1.ConditionTrue
 		isReady = v1.ConditionTrue
 		ctrState = v1.ContainerState{Running: &v1.ContainerStateRunning{StartedAt: v1Time}}
-	case computepb.Instance_STOPPED.String(), computepb.Instance_STOPPING.String(), computepb.Instance_TERMINATED.String():
+	case computepb.Instance_STOPPED.String(), computepb.Instance_TERMINATED.String():
 		// TODO: get application-level metrics for container launcher exit code.
 		phase = v1.PodSucceeded
 		stop, err := instanceStopTimeToV1(instance)
@@ -399,7 +447,9 @@ func podToLaunchSpec(pod *v1.Pod) (*spec.LaunchSpec, error) {
 	ls := &spec.LaunchSpec{
 		ImageRef: ctr.Image,
 		Cmd:      ctr.Args,
-		Envs:     k8sEnvToLSEnv(ctr.Env),
+		// TODO: add toggle to only pass in certain env variables,
+		// or auto-generate config document for env vars.
+		// Envs:     k8sEnvToLSEnv(ctr.Env),
 	}
 	// This may be problematic as the default RestartPolicy on CS is Never whereas on k8s it is Always.
 	ls.RestartPolicy = spec.RestartPolicy(pod.Spec.RestartPolicy)
